@@ -77,51 +77,54 @@ jobs:
         id: check
         run: |
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
-          MODE="${{ steps.resolve.outputs.mode }}"
 
-          if [ "$MODE" = "manual" ]; then
-            # Manual: skip only if HEAD is exactly this commit
-            CURRENT_SHA=$(git rev-parse HEAD)
-            if [ "$CURRENT_SHA" = "$TARGET_SHA" ]; then
-              echo "Already at $TARGET_SHA — skipping."
-              echo "needs_update=false" >> $GITHUB_OUTPUT
-            else
-              echo "Switching to $TARGET_SHA"
-              echo "needs_update=true" >> $GITHUB_OUTPUT
-            fi
+          # Compare the effective tree we maintain. Upstream workflow files are
+          # intentionally ignored because pushing workflow-file changes from
+          # GITHUB_TOKEN can be rejected by GitHub, and this fork keeps its own
+          # automation files.
+          if git diff --quiet HEAD "$TARGET_SHA" -- . ':(exclude).github/workflows'; then
+            echo "Already up to date with $TARGET_SHA, excluding .github/workflows — skipping."
+            echo "needs_update=false" >> $GITHUB_OUTPUT
           else
-            # Auto: skip if target is already in ancestry
-            if git merge-base --is-ancestor "$TARGET_SHA" HEAD 2>/dev/null; then
-              echo "Already up to date with $TARGET_SHA — skipping."
-              echo "needs_update=false" >> $GITHUB_OUTPUT
-            else
-              echo "Update needed — target: $TARGET_SHA"
-              echo "needs_update=true" >> $GITHUB_OUTPUT
-            fi
+            echo "Update needed — target: $TARGET_SHA"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Apply update
         if: steps.check.outputs.needs_update == 'true'
         run: |
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
-          git checkout main
-          # Keep this repository as an upstream snapshot plus this workflow file.
-          # A reset avoids unrelated-history merge conflicts from snapshot commits.
-          git reset --hard "$TARGET_SHA"
+          BASE_SHA=$(git rev-parse HEAD)
+          WORKFLOW_BACKUP=$(mktemp -d)
 
-      - name: Restore workflow file
-        if: steps.check.outputs.needs_update == 'true'
-        run: |
-          # Always keep our own workflow file, never let upstream overwrite it
-          git checkout HEAD@{1} -- .github/workflows/sync-upstream.yml 2>/dev/null || true
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: restore sync-upstream workflow after sync"
+          # Preserve this fork's workflow files, then replace the rest of the
+          # working tree with the target upstream snapshot. This avoids pushing
+          # upstream commits/workflow changes while still syncing project files.
+          git archive "$BASE_SHA" .github/workflows | tar -x -C "$WORKFLOW_BACKUP" 2>/dev/null || true
+
+          git rm -r --ignore-unmatch .
+          git checkout "$TARGET_SHA" -- .
+
+          rm -rf .github/workflows
+          if [ -d "$WORKFLOW_BACKUP/.github/workflows" ]; then
+            mkdir -p .github
+            cp -a "$WORKFLOW_BACKUP/.github/workflows" .github/
           fi
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No effective file changes after excluding .github/workflows."
+            exit 0
+          fi
+
+          SHORT_SHA=$(echo "$TARGET_SHA" | cut -c1-12)
+          git commit -m "chore: sync upstream snapshot $SHORT_SHA"
 
       - name: Push
         if: steps.check.outputs.needs_update == 'true'
         run: |
-          git push origin main --force-with-lease
+          git push origin main
 
       - name: Summary
         run: |
